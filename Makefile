@@ -26,6 +26,9 @@ help:
 	@echo ""
 	@echo "$(BOLD)Inkwell — available targets$(RESET)"
 	@echo ""
+	@echo "$(CYAN)── One-click setup ──────────────────────────────────────────────$(RESET)"
+	@echo "  $(BOLD)make setup$(RESET)            Full first-time setup (k8s + tunnel service)"
+	@echo ""
 	@echo "$(CYAN)── Local dev (Docker Compose) ──────────────────────────────────$(RESET)"
 	@echo "  $(BOLD)make up$(RESET)               Start everything with docker compose"
 	@echo "  $(BOLD)make down$(RESET)             Stop and remove containers"
@@ -50,10 +53,16 @@ help:
 	@echo "  $(BOLD)make k8s-setup$(RESET)        Full first-time cluster setup (installs CNPG operator)"
 	@echo "  $(BOLD)make k8s-cnpg$(RESET)         Install the CloudNativePG operator (one-time)"
 	@echo "  $(BOLD)make k8s-apply$(RESET)        Apply all manifests"
-	@echo "  $(BOLD)make k8s-secrets$(RESET)      Create secrets from template (prompts for values)"
+	@echo "  $(BOLD)make k8s-secrets$(RESET)      Create secrets from .env.secrets"
 	@echo "  $(BOLD)make k8s-delete-secrets$(RESET)  Delete all inkwell secrets (to recreate)"
 	@echo "  $(BOLD)make k8s-status$(RESET)       Show all pods, services, ingress"
 	@echo "  $(BOLD)make k8s-delete$(RESET)       Delete all inkwell resources (keeps cluster)"
+	@echo ""
+	@echo "$(CYAN)── Cloudflare Tunnel ────────────────────────────────────────────$(RESET)"
+	@echo "  $(BOLD)make tunnel-start$(RESET)     Start tunnel in foreground"
+	@echo "  $(BOLD)make tunnel-service$(RESET)   Install tunnel as a systemd service (boot-persistent)"
+	@echo "  $(BOLD)make tunnel-stop$(RESET)      Stop the tunnel systemd service"
+	@echo "  $(BOLD)make tunnel-status$(RESET)    Show tunnel service status"
 	@echo ""
 	@echo "$(CYAN)── Reload (rebuild + redeploy one service) ──────────────────────$(RESET)"
 	@echo "  $(BOLD)make reload svc=blog-service$(RESET)"
@@ -74,6 +83,27 @@ help:
 	@echo "  $(BOLD)make lint$(RESET)             golangci-lint all Go services"
 	@echo "  $(BOLD)make test$(RESET)             go test ./... -race on all services"
 	@echo "  $(BOLD)make test svc=auth-service$(RESET)  Test one service"
+	@echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  ONE-CLICK SETUP
+#  Prerequisites: .env.secrets must exist (copy from .env.example and fill in)
+# ─────────────────────────────────────────────────────────────────────────────
+.PHONY: setup
+setup:
+	@if [ ! -f .env.secrets ]; then \
+		echo "$(RED)✗ .env.secrets not found.$(RESET)"; \
+		echo "  Run: cp .env.example .env.secrets"; \
+		echo "  Then fill in your real values and run make setup again."; \
+		exit 1; \
+	fi
+	@echo "$(GREEN)$(BOLD)Starting Inkwell one-click setup...$(RESET)"
+	@$(MAKE) k8s-setup
+	@$(MAKE) tunnel-service
+	@echo ""
+	@echo "$(GREEN)$(BOLD)✓ Inkwell is fully live!$(RESET)"
+	@echo "$(GREEN)  Local:   http://inkwell.local$(RESET)"
+	@echo "$(GREEN)  Public:  https://inkwell.sharanch.dev$(RESET)"
 	@echo ""
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -104,7 +134,6 @@ ifndef svc
 endif
 	docker compose restart $(svc)
 
-# NEW: run the Vite dev server for the frontend independently of Docker Compose
 dev:
 	@echo "$(GREEN)Starting frontend dev server on http://localhost:3000...$(RESET)"
 	cd frontend && npm install && npm run dev
@@ -184,9 +213,6 @@ _build-one:
 # ─────────────────────────────────────────────────────────────────────────────
 .PHONY: k8s-setup k8s-cnpg k8s-patch k8s-apply k8s-secrets k8s-delete-secrets k8s-status k8s-delete k8s-ingress
 
-# Full first-time setup.
-# FIX: added k8s-cnpg before k8s-apply so the CNPG CRDs exist when the
-#      postgres Cluster objects are applied; added wait-ready at the end.
 k8s-setup: mk-start build k8s-cnpg k8s-secrets k8s-patch k8s-apply k8s-ingress wait-ready
 	@echo ""
 	@echo "$(GREEN)$(BOLD)✓ Inkwell is running on Kubernetes!$(RESET)"
@@ -195,9 +221,6 @@ k8s-setup: mk-start build k8s-cnpg k8s-secrets k8s-patch k8s-apply k8s-ingress w
 	@echo ""
 	@$(MAKE) k8s-status
 
-# NEW: install the CloudNativePG operator (cluster-scoped, one-time).
-# The postgres Cluster manifests use postgresql.cnpg.io/v1 — kubectl apply
-# will fail with "no matches for kind Cluster" without this step.
 k8s-cnpg:
 	@echo "$(CYAN)Installing CloudNativePG operator...$(RESET)"
 	@if kubectl get crd clusters.postgresql.cnpg.io &>/dev/null; then \
@@ -209,7 +232,6 @@ k8s-cnpg:
 		echo "$(GREEN)✓ CNPG operator ready$(RESET)"; \
 	fi
 
-# Patch manifests for local dev (imagePullPolicy + local image tags)
 k8s-patch:
 	@echo "$(CYAN)Patching manifests for local dev...$(RESET)"
 	@for f in infra/k8s/services/*/deployment.yaml; do \
@@ -235,11 +257,14 @@ k8s-ingress:
 	kubectl apply -f infra/k8s/networking/ingress/ingress-dev.yaml
 	@echo "$(GREEN)✓ Ingress applied — http://inkwell.local$(RESET)"
 
-# FIX: old version checked only for inkwell-jwt-secrets, so it would silently
-#      skip all DB and SMTP secrets if JWT had been applied separately before.
-#      Now checks that ALL five expected secrets are present before skipping.
+# Reads values from .env.secrets — no manual editing or prompting required.
 k8s-secrets:
-	@echo "$(CYAN)Creating Kubernetes secrets...$(RESET)"
+	@if [ ! -f .env.secrets ]; then \
+		echo "$(RED)✗ .env.secrets not found.$(RESET)"; \
+		echo "  Run: cp .env.example .env.secrets  then fill in your real values."; \
+		exit 1; \
+	fi
+	@echo "$(CYAN)Creating Kubernetes secrets from .env.secrets...$(RESET)"
 	@MISSING=0; \
 	for secret in inkwell-jwt-secrets postgres-auth-secret postgres-blog-secret postgres-feed-secret smtp-secret; do \
 		kubectl get secret $$secret -n $(NAMESPACE) &>/dev/null || MISSING=1; \
@@ -247,15 +272,35 @@ k8s-secrets:
 	if [ "$$MISSING" = "0" ]; then \
 		echo "$(YELLOW)⚠ All secrets already exist — skipping. Run 'make k8s-delete-secrets' to recreate.$(RESET)"; \
 	else \
-		cp infra/k8s/base/secrets/secrets.template.yaml /tmp/inkwell-secrets.yaml; \
-		echo "$(YELLOW)Edit /tmp/inkwell-secrets.yaml with dev values, then press Enter...$(RESET)"; \
-		read; \
-		kubectl apply -f /tmp/inkwell-secrets.yaml; \
-		rm /tmp/inkwell-secrets.yaml; \
-		echo "$(GREEN)✓ Secrets created$(RESET)"; \
+		set -a && . ./.env.secrets && set +a && \
+		kubectl create secret generic inkwell-jwt-secrets -n $(NAMESPACE) \
+			--from-literal=JWT_SECRET=$$JWT_SECRET \
+			--from-literal=JWT_REFRESH_SECRET=$$JWT_REFRESH_SECRET \
+			--dry-run=client -o yaml | kubectl apply -f - && \
+		kubectl create secret generic postgres-auth-secret -n $(NAMESPACE) \
+			--from-literal=username=auth_user \
+			--from-literal=password=$$POSTGRES_AUTH_PASS \
+			--from-literal=AUTH_DB_PASS=$$POSTGRES_AUTH_PASS \
+			--dry-run=client -o yaml | kubectl apply -f - && \
+		kubectl create secret generic postgres-blog-secret -n $(NAMESPACE) \
+			--from-literal=username=blog_user \
+			--from-literal=password=$$POSTGRES_BLOG_PASS \
+			--from-literal=BLOG_DB_PASS=$$POSTGRES_BLOG_PASS \
+			--dry-run=client -o yaml | kubectl apply -f - && \
+		kubectl create secret generic postgres-feed-secret -n $(NAMESPACE) \
+			--from-literal=username=feed_user \
+			--from-literal=password=$$POSTGRES_FEED_PASS \
+			--from-literal=FEED_DB_PASS=$$POSTGRES_FEED_PASS \
+			--dry-run=client -o yaml | kubectl apply -f - && \
+		kubectl create secret generic smtp-secret -n $(NAMESPACE) \
+			--from-literal=SMTP_HOST=$$SMTP_HOST \
+			--from-literal=SMTP_USER=$$SMTP_USER \
+			--from-literal=SMTP_PASS=$$SMTP_PASS \
+			--from-literal=FROM_EMAIL=$$FROM_EMAIL \
+			--dry-run=client -o yaml | kubectl apply -f - && \
+		echo "$(GREEN)✓ All secrets created$(RESET)"; \
 	fi
 
-# FIX: was missing from .PHONY, causing make to treat it as a file target
 k8s-delete-secrets:
 	kubectl delete secret inkwell-jwt-secrets postgres-auth-secret postgres-blog-secret postgres-feed-secret smtp-secret -n $(NAMESPACE) --ignore-not-found
 
@@ -276,6 +321,38 @@ k8s-delete:
 	@echo "$(RED)Deleting all inkwell resources...$(RESET)"
 	kubectl delete namespace $(NAMESPACE) --ignore-not-found
 	@echo "$(GREEN)✓ Done (cluster still running)$(RESET)"
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  CLOUDFLARE TUNNEL
+# ─────────────────────────────────────────────────────────────────────────────
+.PHONY: tunnel-start tunnel-service tunnel-stop tunnel-status
+
+# Start tunnel in the foreground (useful for testing)
+tunnel-start:
+	@echo "$(GREEN)Starting cloudflared tunnel...$(RESET)"
+	cloudflared tunnel run inkwell-tunnel
+
+# Install as a systemd service so tunnel starts on every boot automatically
+tunnel-service:
+	@echo "$(CYAN)Installing cloudflared as a systemd service...$(RESET)"
+	@if systemctl is-active --quiet cloudflared; then \
+		echo "$(YELLOW)⚠ cloudflared service already running — skipping install$(RESET)"; \
+	else \
+		sudo cloudflared service install && \
+		sudo systemctl enable cloudflared && \
+		sudo systemctl start cloudflared && \
+		echo "$(GREEN)✓ Tunnel service installed and started$(RESET)"; \
+	fi
+	@echo "$(GREEN)  Public URL: https://inkwell.sharanch.dev$(RESET)"
+
+tunnel-stop:
+	@echo "$(YELLOW)Stopping cloudflared tunnel service...$(RESET)"
+	sudo systemctl stop cloudflared
+	@echo "$(GREEN)✓ Tunnel stopped$(RESET)"
+
+tunnel-status:
+	@echo "$(CYAN)── cloudflared service ──$(RESET)"
+	systemctl status cloudflared --no-pager
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  RELOAD — rebuild + redeploy a single service
@@ -332,11 +409,6 @@ endif
 # ─────────────────────────────────────────────────────────────────────────────
 .PHONY: psql redis-cli
 
-# FIX 1: CNPG exposes the primary under  svc/postgres-<name>-rw, not
-#         svc/postgres-<name>. The old target would fail for all three DBs.
-# FIX 2: The secret key is "password" (required by CNPG bootstrap), not
-#         "POSTGRES_PASSWORD". Corrected the jsonpath so the password is
-#         actually retrieved instead of coming back empty.
 psql:
 ifndef db
 	$(error usage: make psql db=auth|blog|feed)
