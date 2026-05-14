@@ -1,10 +1,6 @@
 name: CD
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "infra/k8s/**"
   workflow_dispatch:
     inputs:
       environment:
