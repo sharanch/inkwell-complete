@@ -30,8 +30,8 @@ spec:
           command: ['sh', '-c', 'until nc -z redis 6379; do echo waiting; sleep 2; done']
       containers:
         - name: notify-service
-          image: inkwell/notify-service:dev
-          imagePullPolicy: Never
+          image: ghcr.io/sharanch/inkwell/notify-service:latest
+          imagePullPolicy: Always
           ports:
             - containerPort: 8084
               name: http

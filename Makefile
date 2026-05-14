@@ -7,6 +7,7 @@ NAMESPACE     := inkwell
 SERVICES      := api-gateway auth-service blog-service feed-service notify-service frontend
 MINIKUBE_IP   := $(shell minikube ip 2>/dev/null)
 HOST_ENTRY    := $(MINIKUBE_IP) inkwell.local
+IMAGE_PREFIX  := ghcr.io/sharanch/inkwell
 
 .DEFAULT_GOAL := help
 
@@ -27,7 +28,8 @@ help:
 	@echo "$(BOLD)Inkwell — available targets$(RESET)"
 	@echo ""
 	@echo "$(CYAN)── One-click setup ──────────────────────────────────────────────$(RESET)"
-	@echo "  $(BOLD)make setup$(RESET)            Full first-time setup (k8s + tunnel service)"
+	@echo "  $(BOLD)make setup$(RESET)            Full first-time setup — local build (dev)"
+	@echo "  $(BOLD)make setup-prod$(RESET)       Full first-time setup — pull from ghcr.io (prod)"
 	@echo ""
 	@echo "$(CYAN)── Local dev (Docker Compose) ──────────────────────────────────$(RESET)"
 	@echo "  $(BOLD)make up$(RESET)               Start everything with docker compose"
@@ -50,7 +52,8 @@ help:
 	@echo "  $(BOLD)make build svc=blog-service$(RESET)  Build one service"
 	@echo ""
 	@echo "$(CYAN)── Kubernetes deploy ────────────────────────────────────────────$(RESET)"
-	@echo "  $(BOLD)make k8s-setup$(RESET)        Full first-time cluster setup (installs CNPG operator)"
+	@echo "  $(BOLD)make k8s-setup$(RESET)        Full first-time cluster setup — local images (dev)"
+	@echo "  $(BOLD)make k8s-setup-prod$(RESET)   Full first-time cluster setup — ghcr.io images (prod)"
 	@echo "  $(BOLD)make k8s-cnpg$(RESET)         Install the CloudNativePG operator (one-time)"
 	@echo "  $(BOLD)make k8s-apply$(RESET)        Apply all manifests"
 	@echo "  $(BOLD)make k8s-secrets$(RESET)      Create secrets from .env.secrets"
@@ -89,16 +92,31 @@ help:
 #  ONE-CLICK SETUP
 #  Prerequisites: .env.secrets must exist (copy from .env.example and fill in)
 # ─────────────────────────────────────────────────────────────────────────────
-.PHONY: setup
-setup:
+.PHONY: setup setup-prod
+
+_check-secrets:
 	@if [ ! -f .env.secrets ]; then \
 		echo "$(RED)✗ .env.secrets not found.$(RESET)"; \
 		echo "  Run: cp .env.example .env.secrets"; \
 		echo "  Then fill in your real values and run make setup again."; \
 		exit 1; \
 	fi
-	@echo "$(GREEN)$(BOLD)Starting Inkwell one-click setup...$(RESET)"
+
+setup: _check-secrets
+	@echo "$(GREEN)$(BOLD)Starting Inkwell one-click setup (local build)...$(RESET)"
 	@$(MAKE) k8s-setup
+	@$(MAKE) tunnel-service
+	@echo ""
+	@echo "$(GREEN)$(BOLD)✓ Inkwell is fully live!$(RESET)"
+	@echo "$(GREEN)  Local:   http://inkwell.local$(RESET)"
+	@echo "$(GREEN)  Public:  https://inkwell.sharanch.dev$(RESET)"
+	@echo ""
+
+# Uses pre-built images from ghcr.io — no local Docker build required.
+# Images are published automatically by GitHub Actions on every push to main.
+setup-prod: _check-secrets
+	@echo "$(GREEN)$(BOLD)Starting Inkwell one-click setup (ghcr.io images)...$(RESET)"
+	@$(MAKE) k8s-setup-prod
 	@$(MAKE) tunnel-service
 	@echo ""
 	@echo "$(GREEN)$(BOLD)✓ Inkwell is fully live!$(RESET)"
@@ -211,7 +229,7 @@ _build-one:
 # ─────────────────────────────────────────────────────────────────────────────
 #  KUBERNETES DEPLOY
 # ─────────────────────────────────────────────────────────────────────────────
-.PHONY: k8s-setup k8s-cnpg k8s-patch k8s-apply k8s-secrets k8s-delete-secrets k8s-status k8s-delete k8s-ingress
+.PHONY: k8s-setup k8s-setup-prod k8s-cnpg k8s-patch k8s-patch-prod k8s-apply k8s-secrets k8s-delete-secrets k8s-status k8s-delete k8s-ingress
 
 k8s-setup: mk-start build k8s-cnpg k8s-secrets k8s-patch k8s-apply k8s-ingress wait-ready
 	@echo ""
@@ -221,29 +239,53 @@ k8s-setup: mk-start build k8s-cnpg k8s-secrets k8s-patch k8s-apply k8s-ingress w
 	@echo ""
 	@$(MAKE) k8s-status
 
+# Pull pre-built images from ghcr.io/sharanch/inkwell — no local build needed.
+# Requires images to have been published by GitHub Actions (push to main).
+k8s-setup-prod: mk-start k8s-cnpg k8s-secrets k8s-patch-prod k8s-apply k8s-ingress wait-ready
+	@echo ""
+	@echo "$(GREEN)$(BOLD)✓ Inkwell is running on Kubernetes (ghcr.io images)!$(RESET)"
+	@echo "$(GREEN)  Frontend: http://inkwell.local$(RESET)"
+	@echo "$(GREEN)  API:      http://inkwell.local/api/$(RESET)"
+	@echo ""
+	@$(MAKE) k8s-status
+
 k8s-cnpg:
 	@echo "$(CYAN)Installing CloudNativePG operator...$(RESET)"
-	@if kubectl get crd clusters.postgresql.cnpg.io &>/dev/null; then \
-		echo "$(YELLOW)⚠ CNPG operator already installed — skipping$(RESET)"; \
-	else \
-		kubectl apply -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.23/releases/cnpg-1.23.0.yaml; \
-		echo "$(CYAN)Waiting for CNPG webhook to become ready...$(RESET)"; \
-		kubectl rollout status deployment/cnpg-controller-manager -n cnpg-system --timeout=120s; \
-		echo "$(GREEN)✓ CNPG operator ready$(RESET)"; \
-	fi
+	kubectl apply -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.23/releases/cnpg-1.23.0.yaml
+	@echo "$(CYAN)Waiting for CNPG controller to be ready...$(RESET)"
+	kubectl rollout status deployment/cnpg-controller-manager -n cnpg-system --timeout=120s
+	@echo "$(CYAN)Waiting for CNPG webhook to register with API server...$(RESET)"
+	@sleep 15
+	@echo "$(GREEN)✓ CNPG operator ready$(RESET)"
 
 k8s-patch:
 	@echo "$(CYAN)Patching manifests for local dev...$(RESET)"
 	@for f in infra/k8s/services/*/deployment.yaml; do \
 		sed -i.bak \
-			-e 's|ghcr.io/sharanch/inkwell/\(.*\):latest|inkwell/\1:dev|g' \
+			-e 's|ghcr.io/sharanch/inkwell/\(.*\):.*|inkwell/\1:dev|g' \
 			-e 's|imagePullPolicy: Always|imagePullPolicy: Never|g' \
 			"$$f"; \
 		rm -f "$$f.bak"; \
 	done
-	@echo "$(GREEN)✓ Manifests patched$(RESET)"
+	@echo "$(GREEN)✓ Manifests patched for local dev$(RESET)"
 
-k8s-apply: k8s-patch
+# Restores ghcr.io image references and sets imagePullPolicy: Always.
+# Uses :latest tag — images are pushed on every merge to main.
+k8s-patch-prod:
+	@echo "$(CYAN)Patching manifests for prod (ghcr.io images)...$(RESET)"
+	@for svc in $(SERVICES); do \
+		f="infra/k8s/services/$$svc/deployment.yaml"; \
+		[ -f "$$f" ] || continue; \
+		sed -i.bak \
+			-e "s|image: inkwell/$$svc:dev|image: $(IMAGE_PREFIX)/$$svc:latest|g" \
+			-e "s|image: $(IMAGE_PREFIX)/$$svc:.*|image: $(IMAGE_PREFIX)/$$svc:latest|g" \
+			-e 's|imagePullPolicy: Never|imagePullPolicy: Always|g' \
+			"$$f"; \
+		rm -f "$$f.bak"; \
+	done
+	@echo "$(GREEN)✓ Manifests patched for prod ($(IMAGE_PREFIX)/<svc>:latest)$(RESET)"
+
+k8s-apply:
 	@echo "$(CYAN)Applying manifests...$(RESET)"
 	kubectl apply -f infra/k8s/base/namespaces/namespaces.yaml
 	kubectl apply -f infra/k8s/base/configmaps/configmaps.yaml
@@ -265,6 +307,7 @@ k8s-secrets:
 		exit 1; \
 	fi
 	@echo "$(CYAN)Creating Kubernetes secrets from .env.secrets...$(RESET)"
+	@kubectl create namespace $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
 	@MISSING=0; \
 	for secret in inkwell-jwt-secrets postgres-auth-secret postgres-blog-secret postgres-feed-secret smtp-secret; do \
 		kubectl get secret $$secret -n $(NAMESPACE) &>/dev/null || MISSING=1; \

@@ -30,8 +30,8 @@ spec:
       terminationGracePeriodSeconds: 30
       containers:
         - name: api-gateway
-          image: inkwell/api-gateway:dev
-          imagePullPolicy: Never
+          image: ghcr.io/sharanch/inkwell/api-gateway:latest
+          imagePullPolicy: Always
           ports:
             - containerPort: 8080
               name: http
