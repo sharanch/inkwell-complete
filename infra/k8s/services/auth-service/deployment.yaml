@@ -37,8 +37,8 @@ spec:
           command: ['sh', '-c', 'until nc -z redis 6379; do echo waiting for redis; sleep 2; done']
       containers:
         - name: auth-service
-          image: ghcr.io/sharanch/inkwell/auth-service:latest
-          imagePullPolicy: Always
+          image: inkwell/auth-service:dev
+          imagePullPolicy: Never
           ports:
             - containerPort: 8081
               name: http

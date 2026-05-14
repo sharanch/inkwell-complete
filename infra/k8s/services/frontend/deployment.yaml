@@ -26,8 +26,8 @@ spec:
       terminationGracePeriodSeconds: 10
       containers:
         - name: frontend
-          image: ghcr.io/sharanch/inkwell/frontend:latest
-          imagePullPolicy: Always
+          image: inkwell/frontend:dev
+          imagePullPolicy: Never
           ports:
             - containerPort: 80
               name: http

@@ -34,8 +34,8 @@ spec:
           command: ['sh', '-c', 'until nc -z postgres-blog-rw 5432; do echo waiting for postgres-blog; sleep 2; done']
       containers:
         - name: blog-service
-          image: ghcr.io/sharanch/inkwell/blog-service:latest
-          imagePullPolicy: Always
+          image: inkwell/blog-service:dev
+          imagePullPolicy: Never
           ports:
             - containerPort: 8082
               name: http
