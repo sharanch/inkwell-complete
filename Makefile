@@ -32,6 +32,7 @@ help:
 	@echo "  $(BOLD)make logs$(RESET)             Tail all service logs"
 	@echo "  $(BOLD)make logs svc=auth-service$(RESET)  Tail a specific service"
 	@echo "  $(BOLD)make restart svc=blog-service$(RESET)  Restart one service"
+	@echo "  $(BOLD)make dev$(RESET)              Run frontend dev server (Vite, port 3000)"
 	@echo ""
 	@echo "$(CYAN)── Minikube ─────────────────────────────────────────────────────$(RESET)"
 	@echo "  $(BOLD)make mk-start$(RESET)         Start minikube with correct resources"
@@ -46,9 +47,11 @@ help:
 	@echo "  $(BOLD)make build svc=blog-service$(RESET)  Build one service"
 	@echo ""
 	@echo "$(CYAN)── Kubernetes deploy ────────────────────────────────────────────$(RESET)"
-	@echo "  $(BOLD)make k8s-setup$(RESET)        Full first-time cluster setup"
+	@echo "  $(BOLD)make k8s-setup$(RESET)        Full first-time cluster setup (installs CNPG operator)"
+	@echo "  $(BOLD)make k8s-cnpg$(RESET)         Install the CloudNativePG operator (one-time)"
 	@echo "  $(BOLD)make k8s-apply$(RESET)        Apply all manifests"
 	@echo "  $(BOLD)make k8s-secrets$(RESET)      Create secrets from template (prompts for values)"
+	@echo "  $(BOLD)make k8s-delete-secrets$(RESET)  Delete all inkwell secrets (to recreate)"
 	@echo "  $(BOLD)make k8s-status$(RESET)       Show all pods, services, ingress"
 	@echo "  $(BOLD)make k8s-delete$(RESET)       Delete all inkwell resources (keeps cluster)"
 	@echo ""
@@ -62,7 +65,9 @@ help:
 	@echo "  $(BOLD)make describe svc=blog-service$(RESET) Describe pods for a service"
 	@echo ""
 	@echo "$(CYAN)── Database ─────────────────────────────────────────────────────$(RESET)"
-	@echo "  $(BOLD)make psql db=auth$(RESET)     Connect to postgres-auth (port-forward)"
+	@echo "  $(BOLD)make psql db=auth$(RESET)     Connect to postgres-auth (port-forward via CNPG -rw)"
+	@echo "  $(BOLD)make psql db=blog$(RESET)     Connect to postgres-blog"
+	@echo "  $(BOLD)make psql db=feed$(RESET)     Connect to postgres-feed"
 	@echo "  $(BOLD)make redis-cli$(RESET)        Connect to Redis"
 	@echo ""
 	@echo "$(CYAN)── Production / CI ──────────────────────────────────────────────$(RESET)"
@@ -74,7 +79,7 @@ help:
 # ─────────────────────────────────────────────────────────────────────────────
 #  DOCKER COMPOSE (local dev)
 # ─────────────────────────────────────────────────────────────────────────────
-.PHONY: up down logs restart
+.PHONY: up down logs restart dev
 
 up:
 	@echo "$(GREEN)Starting Inkwell with Docker Compose...$(RESET)"
@@ -98,6 +103,11 @@ ifndef svc
 	$(error svc is required: make restart svc=<service-name>)
 endif
 	docker compose restart $(svc)
+
+# NEW: run the Vite dev server for the frontend independently of Docker Compose
+dev:
+	@echo "$(GREEN)Starting frontend dev server on http://localhost:3000...$(RESET)"
+	cd frontend && npm install && npm run dev
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  MINIKUBE
@@ -172,16 +182,32 @@ _build-one:
 # ─────────────────────────────────────────────────────────────────────────────
 #  KUBERNETES DEPLOY
 # ─────────────────────────────────────────────────────────────────────────────
-.PHONY: k8s-setup k8s-patch k8s-apply k8s-secrets k8s-status k8s-delete k8s-ingress
+.PHONY: k8s-setup k8s-cnpg k8s-patch k8s-apply k8s-secrets k8s-delete-secrets k8s-status k8s-delete k8s-ingress
 
-# Full first-time setup
-k8s-setup: mk-start build k8s-secrets k8s-patch k8s-apply k8s-ingress
+# Full first-time setup.
+# FIX: added k8s-cnpg before k8s-apply so the CNPG CRDs exist when the
+#      postgres Cluster objects are applied; added wait-ready at the end.
+k8s-setup: mk-start build k8s-cnpg k8s-secrets k8s-patch k8s-apply k8s-ingress wait-ready
 	@echo ""
 	@echo "$(GREEN)$(BOLD)✓ Inkwell is running on Kubernetes!$(RESET)"
 	@echo "$(GREEN)  Frontend: http://inkwell.local$(RESET)"
 	@echo "$(GREEN)  API:      http://inkwell.local/api/$(RESET)"
 	@echo ""
 	@$(MAKE) k8s-status
+
+# NEW: install the CloudNativePG operator (cluster-scoped, one-time).
+# The postgres Cluster manifests use postgresql.cnpg.io/v1 — kubectl apply
+# will fail with "no matches for kind Cluster" without this step.
+k8s-cnpg:
+	@echo "$(CYAN)Installing CloudNativePG operator...$(RESET)"
+	@if kubectl get crd clusters.postgresql.cnpg.io &>/dev/null; then \
+		echo "$(YELLOW)⚠ CNPG operator already installed — skipping$(RESET)"; \
+	else \
+		kubectl apply -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.23/releases/cnpg-1.23.0.yaml; \
+		echo "$(CYAN)Waiting for CNPG webhook to become ready...$(RESET)"; \
+		kubectl rollout status deployment/cnpg-controller-manager -n cnpg-system --timeout=120s; \
+		echo "$(GREEN)✓ CNPG operator ready$(RESET)"; \
+	fi
 
 # Patch manifests for local dev (imagePullPolicy + local image tags)
 k8s-patch:
@@ -209,10 +235,17 @@ k8s-ingress:
 	kubectl apply -f infra/k8s/networking/ingress/ingress-dev.yaml
 	@echo "$(GREEN)✓ Ingress applied — http://inkwell.local$(RESET)"
 
+# FIX: old version checked only for inkwell-jwt-secrets, so it would silently
+#      skip all DB and SMTP secrets if JWT had been applied separately before.
+#      Now checks that ALL five expected secrets are present before skipping.
 k8s-secrets:
 	@echo "$(CYAN)Creating Kubernetes secrets...$(RESET)"
-	@if kubectl get secret inkwell-jwt-secrets -n $(NAMESPACE) &>/dev/null; then \
-		echo "$(YELLOW)⚠ Secrets already exist — skipping. Run 'make k8s-delete-secrets' to recreate.$(RESET)"; \
+	@MISSING=0; \
+	for secret in inkwell-jwt-secrets postgres-auth-secret postgres-blog-secret postgres-feed-secret smtp-secret; do \
+		kubectl get secret $$secret -n $(NAMESPACE) &>/dev/null || MISSING=1; \
+	done; \
+	if [ "$$MISSING" = "0" ]; then \
+		echo "$(YELLOW)⚠ All secrets already exist — skipping. Run 'make k8s-delete-secrets' to recreate.$(RESET)"; \
 	else \
 		cp infra/k8s/base/secrets/secrets.template.yaml /tmp/inkwell-secrets.yaml; \
 		echo "$(YELLOW)Edit /tmp/inkwell-secrets.yaml with dev values, then press Enter...$(RESET)"; \
@@ -222,6 +255,7 @@ k8s-secrets:
 		echo "$(GREEN)✓ Secrets created$(RESET)"; \
 	fi
 
+# FIX: was missing from .PHONY, causing make to treat it as a file target
 k8s-delete-secrets:
 	kubectl delete secret inkwell-jwt-secrets postgres-auth-secret postgres-blog-secret postgres-feed-secret smtp-secret -n $(NAMESPACE) --ignore-not-found
 
@@ -298,15 +332,20 @@ endif
 # ─────────────────────────────────────────────────────────────────────────────
 .PHONY: psql redis-cli
 
+# FIX 1: CNPG exposes the primary under  svc/postgres-<name>-rw, not
+#         svc/postgres-<name>. The old target would fail for all three DBs.
+# FIX 2: The secret key is "password" (required by CNPG bootstrap), not
+#         "POSTGRES_PASSWORD". Corrected the jsonpath so the password is
+#         actually retrieved instead of coming back empty.
 psql:
 ifndef db
 	$(error usage: make psql db=auth|blog|feed)
 endif
-	@echo "$(CYAN)Port-forwarding postgres-$(db):5432 → localhost:5432...$(RESET)"
-	@kubectl port-forward -n $(NAMESPACE) svc/postgres-$(db) 5432:5432 &
+	@echo "$(CYAN)Port-forwarding postgres-$(db)-rw:5432 → localhost:5432...$(RESET)"
+	@kubectl port-forward -n $(NAMESPACE) svc/postgres-$(db)-rw 5432:5432 &
 	@sleep 1
 	@PGPASSWORD=$$(kubectl get secret postgres-$(db)-secret -n $(NAMESPACE) \
-		-o jsonpath='{.data.POSTGRES_PASSWORD}' | base64 -d) \
+		-o jsonpath='{.data.password}' | base64 -d) \
 		psql -h localhost -U $(db)_user $(db)_db
 
 redis-cli:
