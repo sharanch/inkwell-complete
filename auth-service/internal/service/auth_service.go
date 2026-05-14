@@ -12,23 +12,41 @@ import (
 
 	"github.com/sharanch/inkwell/auth-service/config"
 	"github.com/sharanch/inkwell/auth-service/internal/model"
-	"github.com/sharanch/inkwell/auth-service/internal/repository"
 )
 
 var (
-	ErrInvalidOTP    = errors.New("invalid or expired OTP")
-	ErrRateLimited   = errors.New("too many OTP requests, please wait")
-	ErrInvalidToken  = errors.New("invalid or expired token")
+	ErrInvalidOTP   = errors.New("invalid or expired OTP")
+	ErrRateLimited  = errors.New("too many OTP requests, please wait")
+	ErrInvalidToken = errors.New("invalid or expired token")
 )
 
-type AuthService struct {
-	users    *repository.UserRepository
-	otps     *repository.OTPRepository
-	notify   *NotifyClient
-	cfg      *config.Config
+// ─── Interfaces (enable unit testing without a real DB or Redis) ─────────────
+
+type userRepository interface {
+	FindOrCreate(ctx context.Context, email string) (*model.User, error)
+	GetByID(ctx context.Context, id string) (*model.User, error)
 }
 
-func NewAuthService(users *repository.UserRepository, otps *repository.OTPRepository, notify *NotifyClient, cfg *config.Config) *AuthService {
+type otpRepository interface {
+	Store(ctx context.Context, email, code string, ttl time.Duration) error
+	Verify(ctx context.Context, email, code string) (bool, error)
+	RateLimit(ctx context.Context, email string) (bool, error)
+}
+
+type notifyClient interface {
+	SendOTP(ctx context.Context, email, code string) error
+}
+
+// ─── Service ─────────────────────────────────────────────────────────────────
+
+type AuthService struct {
+	users  userRepository
+	otps   otpRepository
+	notify notifyClient
+	cfg    *config.Config
+}
+
+func NewAuthService(users userRepository, otps otpRepository, notify notifyClient, cfg *config.Config) *AuthService {
 	return &AuthService{users: users, otps: otps, notify: notify, cfg: cfg}
 }
 

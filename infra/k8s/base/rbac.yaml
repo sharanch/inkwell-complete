@@ -1,11 +1,57 @@
+# ─── Per-service ServiceAccounts ──────────────────────────────────────────────
+# Each service gets its own ServiceAccount so Istio AuthorizationPolicies can
+# reference specific SPIFFE principals (cluster.local/ns/inkwell/sa/<name>).
+# Using a single shared SA would mean "any service can call any other service",
+# which defeats zero-trust enforcement entirely.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: inkwell-sa
+  name: inkwell-sa-frontend
   namespace: inkwell
   labels:
     app.kubernetes.io/managed-by: argocd
 ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: inkwell-sa-api-gateway
+  namespace: inkwell
+  labels:
+    app.kubernetes.io/managed-by: argocd
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: inkwell-sa-auth-service
+  namespace: inkwell
+  labels:
+    app.kubernetes.io/managed-by: argocd
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: inkwell-sa-blog-service
+  namespace: inkwell
+  labels:
+    app.kubernetes.io/managed-by: argocd
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: inkwell-sa-feed-service
+  namespace: inkwell
+  labels:
+    app.kubernetes.io/managed-by: argocd
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: inkwell-sa-notify-service
+  namespace: inkwell
+  labels:
+    app.kubernetes.io/managed-by: argocd
+---
+# ─── Shared Role + RoleBinding (read ConfigMaps and Secrets) ─────────────────
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -23,7 +69,22 @@ metadata:
   namespace: inkwell
 subjects:
   - kind: ServiceAccount
-    name: inkwell-sa
+    name: inkwell-sa-frontend
+    namespace: inkwell
+  - kind: ServiceAccount
+    name: inkwell-sa-api-gateway
+    namespace: inkwell
+  - kind: ServiceAccount
+    name: inkwell-sa-auth-service
+    namespace: inkwell
+  - kind: ServiceAccount
+    name: inkwell-sa-blog-service
+    namespace: inkwell
+  - kind: ServiceAccount
+    name: inkwell-sa-feed-service
+    namespace: inkwell
+  - kind: ServiceAccount
+    name: inkwell-sa-notify-service
     namespace: inkwell
 roleRef:
   apiGroup: rbac.authorization.k8s.io

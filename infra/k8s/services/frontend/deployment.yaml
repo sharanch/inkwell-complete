@@ -22,7 +22,7 @@ spec:
         app: frontend
         version: v1
     spec:
-      serviceAccountName: inkwell-sa
+      serviceAccountName: inkwell-sa-frontend
       terminationGracePeriodSeconds: 10
       containers:
         - name: frontend

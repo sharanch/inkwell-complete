@@ -26,12 +26,12 @@ spec:
         prometheus.io/port: "8082"
         prometheus.io/path: "/metrics"
     spec:
-      serviceAccountName: inkwell-sa
+      serviceAccountName: inkwell-sa-blog-service
       terminationGracePeriodSeconds: 30
       initContainers:
         - name: wait-for-postgres
           image: busybox:1.36
-          command: ['sh', '-c', 'until nc -z postgres-blog 5432; do echo waiting for postgres-blog; sleep 2; done']
+          command: ['sh', '-c', 'until nc -z postgres-blog-rw 5432; do echo waiting for postgres-blog; sleep 2; done']
       containers:
         - name: blog-service
           image: ghcr.io/sharanch/inkwell/blog-service:latest
@@ -54,7 +54,7 @@ spec:
                   name: postgres-blog-secret
                   key: BLOG_DB_PASS
             - name: DB_URL
-              value: "postgres://blog_user:$(BLOG_DB_PASS)@postgres-blog:5432/blog_db?sslmode=disable"
+              value: "postgres://blog_user:$(BLOG_DB_PASS)@postgres-blog-rw:5432/blog_db?sslmode=disable"
           resources:
             requests:
               cpu: 100m

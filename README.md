@@ -31,7 +31,10 @@ services trust the injected `X-User-ID` header.
 - **Backend**: Go 1.22, Chi router, sqlx, golang-jwt, go-redis
 - **Frontend**: React 18, Vite, Tailwind CSS, React Router
 - **Infra**: Kubernetes (minikube), Docker Compose, Postgres 16, Redis 7, Nginx
+- **Observability**: Prometheus metrics at `/metrics` (Rate, Errors, Duration) on the API gateway
 - **CI**: GitHub Actions — lint, test, build on every PR
+
+> **Deployment scope:** The infra manifests (`infra/k8s/`, ArgoCD, Istio) are written to production patterns (mTLS, HPA, PDB, cert-manager) but are validated locally on Minikube. No live cloud deployment exists. For a running demo, use Option A (Docker Compose) below.
 
 ---
 

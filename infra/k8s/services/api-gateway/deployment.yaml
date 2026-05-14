@@ -26,7 +26,7 @@ spec:
         prometheus.io/port: "8080"
         prometheus.io/path: "/metrics"
     spec:
-      serviceAccountName: inkwell-sa
+      serviceAccountName: inkwell-sa-api-gateway
       terminationGracePeriodSeconds: 30
       containers:
         - name: api-gateway

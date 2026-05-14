@@ -22,7 +22,7 @@ spec:
         app: notify-service
         version: v1
     spec:
-      serviceAccountName: inkwell-sa
+      serviceAccountName: inkwell-sa-notify-service
       terminationGracePeriodSeconds: 30
       initContainers:
         - name: wait-for-redis

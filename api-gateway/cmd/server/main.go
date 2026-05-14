@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -19,7 +20,32 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/go-chi/cors"
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
+
+// ─── Metrics ─────────────────────────────────────────────────────────────────
+
+var (
+	httpRequestsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "inkwell_gateway_requests_total",
+		Help: "Total HTTP requests handled by the API gateway.",
+	}, []string{"method", "path", "status"})
+
+	httpRequestDuration = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "inkwell_gateway_request_duration_seconds",
+		Help:    "HTTP request latency at the API gateway.",
+		Buckets: prometheus.DefBuckets,
+	}, []string{"method", "path"})
+
+	httpRequestsInFlight = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "inkwell_gateway_requests_in_flight",
+		Help: "Number of HTTP requests currently being processed.",
+	})
+)
+
+// ─── Config ───────────────────────────────────────────────────────────────────
 
 type Config struct {
 	Port             string
@@ -46,6 +72,8 @@ type Claims struct {
 	Email  string `json:"email"`
 }
 
+// ─── Main ────────────────────────────────────────────────────────────────────
+
 func main() {
 	cfg := loadConfig()
 
@@ -53,6 +81,7 @@ func main() {
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 	r.Use(middleware.RequestID)
+	r.Use(prometheusMiddleware) // RED metrics on every request
 	r.Use(cors.Handler(cors.Options{
 		AllowedOrigins:   []string{"http://localhost:3000", "http://127.0.0.1:3000", "http://inkwell.local"},
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
@@ -63,6 +92,9 @@ func main() {
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"status":"ok","service":"gateway"}`))
 	})
+
+	// Prometheus scrape endpoint — matches the annotation on the K8s Deployment
+	r.Handle("/metrics", promhttp.Handler())
 
 	// Auth routes — no JWT required
 	r.Mount("/api/v1/auth", proxyTo(cfg.AuthServiceURL))
@@ -100,13 +132,65 @@ func main() {
 	srv.Shutdown(ctx)
 }
 
+// ─── Middleware ───────────────────────────────────────────────────────────────
+
+// prometheusMiddleware records RED metrics (Rate, Errors, Duration) per request.
+// It uses a responseWriter wrapper to capture the status code after the handler runs.
+func prometheusMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Skip the /metrics endpoint itself to avoid self-referential noise
+		if r.URL.Path == "/metrics" {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		start := time.Now()
+		httpRequestsInFlight.Inc()
+		defer httpRequestsInFlight.Dec()
+
+		ww := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(ww, r)
+
+		// Normalise path: replace chi URL params with their pattern so cardinality
+		// stays bounded (e.g. /api/v1/posts/abc123 → /api/v1/posts/{id})
+		path := normalisePath(r)
+		status := strconv.Itoa(ww.status)
+
+		httpRequestsTotal.WithLabelValues(r.Method, path, status).Inc()
+		httpRequestDuration.WithLabelValues(r.Method, path).Observe(time.Since(start).Seconds())
+	})
+}
+
+// normalisePath returns the matched chi route pattern when available, falling
+// back to the raw URL path. This prevents unbounded label cardinality from
+// unique resource IDs (a classic Prometheus footgun).
+func normalisePath(r *http.Request) string {
+	if rctx := chi.RouteContext(r.Context()); rctx != nil && rctx.RoutePattern() != "" {
+		return rctx.RoutePattern()
+	}
+	return r.URL.Path
+}
+
+// statusWriter wraps http.ResponseWriter to capture the status code.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (sw *statusWriter) WriteHeader(code int) {
+	sw.status = code
+	sw.ResponseWriter.WriteHeader(code)
+}
+
+// ─── JWT middleware ───────────────────────────────────────────────────────────
+
 // jwtMiddleware validates the Bearer token and injects X-User-ID / X-User-Email headers.
 func jwtMiddleware(secret string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			bearer := r.Header.Get("Authorization")
 			tokenStr := strings.TrimPrefix(bearer, "Bearer ")
-			if tokenStr == "" {
+			if tokenStr == ""  {
 				writeError(w, http.StatusUnauthorized, "authorization required")
 				return
 			}
@@ -143,6 +227,8 @@ func jwtMiddleware(secret string) func(http.Handler) http.Handler {
 	}
 }
 
+// ─── Proxy helpers ────────────────────────────────────────────────────────────
+
 func proxyTo(target string) http.Handler {
 	return http.HandlerFunc(proxyHandler(target))
 }
@@ -158,6 +244,8 @@ func proxyHandler(target string) http.HandlerFunc {
 		proxy.ServeHTTP(w, r)
 	}
 }
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 func writeError(w http.ResponseWriter, status int, msg string) {
 	w.Header().Set("Content-Type", "application/json")

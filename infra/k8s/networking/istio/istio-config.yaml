@@ -1,4 +1,36 @@
-# ─── Istio Gateway ────────────────────────────────────────────────────────────
+# ─── Inkwell Istio Configuration ─────────────────────────────────────────────
+#
+# Traffic flow (all mTLS enforced by PeerAuthentication STRICT below):
+#
+#   Internet
+#     │  HTTPS (cert-manager + Let's Encrypt via nginx Ingress)
+#     ▼
+#   Istio IngressGateway
+#     ├── /api/*  → api-gateway
+#     └── /*      → frontend
+#                      │
+#                      └──► api-gateway (XHR/fetch)
+#                               │
+#                    ┌──────────┼──────────┐
+#                    ▼          ▼          ▼
+#              auth-service  blog-service  feed-service
+#                    │                        │
+#                    ▼                        │
+#             notify-service          blog-service (internal)
+#
+#   Data layer (TCP, not HTTP — AuthorizationPolicies enforce source SA):
+#     auth-service  → postgres-auth-rw:5432
+#     auth-service  → redis:6379
+#     blog-service  → postgres-blog-rw:5432
+#     feed-service  → postgres-feed-rw:5432
+#     feed-service  → redis:6379
+#
+# AuthorizationPolicy principals use SPIFFE IDs:
+#   cluster.local/ns/inkwell/sa/inkwell-sa-<service>
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ─── Gateway ──────────────────────────────────────────────────────────────────
 apiVersion: networking.istio.io/v1beta1
 kind: Gateway
 metadata:
@@ -14,7 +46,7 @@ spec:
         protocol: HTTPS
       tls:
         mode: SIMPLE
-        credentialName: inkwell-tls-cert    # from cert-manager
+        credentialName: inkwell-tls-cert    # provisioned by cert-manager
       hosts:
         - "inkwell.app"
         - "www.inkwell.app"
@@ -26,9 +58,9 @@ spec:
         - "inkwell.app"
         - "www.inkwell.app"
       tls:
-        httpsRedirect: true   # Auto-redirect HTTP → HTTPS
+        httpsRedirect: true
 ---
-# ─── VirtualService: Frontend + API routing ───────────────────────────────────
+# ─── VirtualService: Internet → frontend / api-gateway ───────────────────────
 apiVersion: networking.istio.io/v1beta1
 kind: VirtualService
 metadata:
@@ -41,7 +73,6 @@ spec:
   gateways:
     - inkwell-gateway
   http:
-    # API routes → api-gateway
     - match:
         - uri:
             prefix: /api/
@@ -55,7 +86,6 @@ spec:
         attempts: 3
         perTryTimeout: 10s
         retryOn: gateway-error,connect-failure,retriable-4xx
-    # All other routes → frontend
     - match:
         - uri:
             prefix: /
@@ -66,7 +96,19 @@ spec:
               number: 80
       timeout: 15s
 ---
-# ─── DestinationRules: circuit breaker + mTLS per service ─────────────────────
+# ─── PeerAuthentication: enforce mTLS across the entire namespace ─────────────
+# All pod-to-pod traffic in the inkwell namespace must be mTLS.
+# Plain-text connections from un-injected pods are rejected.
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: inkwell
+spec:
+  mtls:
+    mode: STRICT
+---
+# ─── DestinationRules: mTLS mode + circuit breaker per upstream ───────────────
 apiVersion: networking.istio.io/v1beta1
 kind: DestinationRule
 metadata:
@@ -161,23 +203,195 @@ spec:
     tls:
       mode: ISTIO_MUTUAL
 ---
-# ─── PeerAuthentication: enforce mTLS cluster-wide ────────────────────────────
-apiVersion: security.istio.io/v1beta1
-kind: PeerAuthentication
+# DestinationRules for the CNPG -rw services use TCP (not HTTP) mode.
+# ISTIO_MUTUAL applies to the Envoy sidecar tunnel; the Postgres wire
+# protocol runs inside that tunnel unchanged.
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
 metadata:
-  name: default
+  name: postgres-auth-dr
   namespace: inkwell
 spec:
-  mtls:
-    mode: STRICT
+  host: postgres-auth-rw
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 50
+        connectTimeout: 5s
+        tcpKeepalive:
+          time: 300s
+          interval: 75s
 ---
-# ─── AuthorizationPolicies: zero-trust service-to-service ─────────────────────
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: postgres-blog-dr
+  namespace: inkwell
+spec:
+  host: postgres-blog-rw
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 50
+        connectTimeout: 5s
+        tcpKeepalive:
+          time: 300s
+          interval: 75s
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: postgres-feed-dr
+  namespace: inkwell
+spec:
+  host: postgres-feed-rw
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 50
+        connectTimeout: 5s
+        tcpKeepalive:
+          time: 300s
+          interval: 75s
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: redis-dr
+  namespace: inkwell
+spec:
+  host: redis
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 100
+        connectTimeout: 3s
+        tcpKeepalive:
+          time: 300s
+          interval: 75s
+---
+# ─── AuthorizationPolicies: zero-trust allowlist ──────────────────────────────
+#
+# Default deny: Istio denies all traffic unless explicitly allowed.
+# Each policy below names EXACTLY which source SA may reach which destination
+# and which methods/ports it may use.
+#
+# HTTP layer (L7) policies cover services that speak HTTP.
+# TCP layer (L4) policies cover Postgres and Redis (opaque TCP).
 
-# notify-service is internal only — only auth-service may call it
+# frontend → api-gateway (browser XHR)
 apiVersion: security.istio.io/v1beta1
 kind: AuthorizationPolicy
 metadata:
-  name: notify-service-authz
+  name: authz-api-gateway
+  namespace: inkwell
+spec:
+  selector:
+    matchLabels:
+      app: api-gateway
+  rules:
+    # External traffic arrives via the Istio IngressGateway
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/istio-system/sa/istio-ingressgateway-service-account"
+      to:
+        - operation:
+            methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+            ports: ["8080"]
+    # Internal: frontend pod calling the API directly (e.g. SSR or health checks)
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/inkwell/sa/inkwell-sa-frontend"
+      to:
+        - operation:
+            methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"]
+            ports: ["8080"]
+---
+# api-gateway → auth-service
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: authz-auth-service
+  namespace: inkwell
+spec:
+  selector:
+    matchLabels:
+      app: auth-service
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/inkwell/sa/inkwell-sa-api-gateway"
+      to:
+        - operation:
+            methods: ["GET", "POST"]
+            ports: ["8081"]
+---
+# api-gateway → blog-service
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: authz-blog-service
+  namespace: inkwell
+spec:
+  selector:
+    matchLabels:
+      app: blog-service
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/inkwell/sa/inkwell-sa-api-gateway"
+      to:
+        - operation:
+            methods: ["GET", "POST", "PUT", "DELETE"]
+            ports: ["8082"]
+    # feed-service calls blog-service to hydrate post details for the feed
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/inkwell/sa/inkwell-sa-feed-service"
+      to:
+        - operation:
+            methods: ["POST"]
+            paths: ["/api/v1/posts/batch"]
+            ports: ["8082"]
+---
+# api-gateway → feed-service
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: authz-feed-service
+  namespace: inkwell
+spec:
+  selector:
+    matchLabels:
+      app: feed-service
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/inkwell/sa/inkwell-sa-api-gateway"
+      to:
+        - operation:
+            methods: ["GET", "POST", "PUT", "DELETE"]
+            ports: ["8083"]
+---
+# auth-service → notify-service (OTP email dispatch — internal only)
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: authz-notify-service
   namespace: inkwell
 spec:
   selector:
@@ -187,24 +401,95 @@ spec:
     - from:
         - source:
             principals:
-              - "cluster.local/ns/inkwell/sa/inkwell-sa"
+              - "cluster.local/ns/inkwell/sa/inkwell-sa-auth-service"
       to:
         - operation:
             methods: ["POST"]
-            paths: ["/api/*"]
+            paths: ["/internal/send-otp"]
+            ports: ["8084"]
+---
+# ─── TCP AuthorizationPolicies: database layer ────────────────────────────────
+#
+# Istio can enforce TCP-level policies (source SA + destination port).
+# These prevent, for example, feed-service from accidentally connecting to
+# postgres-auth-rw — a lateral-movement risk if a service is compromised.
 
-# Backend services: only api-gateway may call them externally
+# auth-service → postgres-auth-rw:5432
 apiVersion: security.istio.io/v1beta1
 kind: AuthorizationPolicy
 metadata:
-  name: backend-services-authz
+  name: authz-postgres-auth
   namespace: inkwell
 spec:
   selector:
     matchLabels:
-      app: auth-service  # Applied per service — replicate for blog/feed
+      cnpg.io/cluster: postgres-auth    # CNPG labels its pods with this
+      role: primary
   rules:
     - from:
         - source:
             principals:
-              - "cluster.local/ns/inkwell/sa/inkwell-sa"
+              - "cluster.local/ns/inkwell/sa/inkwell-sa-auth-service"
+      to:
+        - operation:
+            ports: ["5432"]
+---
+# blog-service → postgres-blog-rw:5432
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: authz-postgres-blog
+  namespace: inkwell
+spec:
+  selector:
+    matchLabels:
+      cnpg.io/cluster: postgres-blog
+      role: primary
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/inkwell/sa/inkwell-sa-blog-service"
+      to:
+        - operation:
+            ports: ["5432"]
+---
+# feed-service → postgres-feed-rw:5432
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: authz-postgres-feed
+  namespace: inkwell
+spec:
+  selector:
+    matchLabels:
+      cnpg.io/cluster: postgres-feed
+      role: primary
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/inkwell/sa/inkwell-sa-feed-service"
+      to:
+        - operation:
+            ports: ["5432"]
+---
+# auth-service + feed-service → redis:6379
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: authz-redis
+  namespace: inkwell
+spec:
+  selector:
+    matchLabels:
+      app: redis
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/inkwell/sa/inkwell-sa-auth-service"
+              - "cluster.local/ns/inkwell/sa/inkwell-sa-feed-service"
+      to:
+        - operation:
+            ports: ["6379"]
