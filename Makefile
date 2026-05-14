@@ -27,6 +27,11 @@ help:
 	@echo ""
 	@echo "$(BOLD)Inkwell — available targets$(RESET)"
 	@echo ""
+	@echo "$(CYAN)── One-click dev ─────────────────────────────────────────────────$(RESET)"
+	@echo "  $(BOLD)make dev-up$(RESET)           Start full dev env — pulls from ghcr.io/sharanch/inkwell"
+	@echo "  $(BOLD)make dev-up FORCE=1$(RESET)   Nuke + rebuild from scratch"
+	@echo "  $(BOLD)make dev-down$(RESET)         Stop cluster and minikube"
+	@echo ""
 	@echo "$(CYAN)── One-click setup ──────────────────────────────────────────────$(RESET)"
 	@echo "  $(BOLD)make setup$(RESET)            Full first-time setup — local build (dev)"
 	@echo "  $(BOLD)make setup-prod$(RESET)       Full first-time setup — pull from ghcr.io (prod)"
@@ -87,6 +92,151 @@ help:
 	@echo "  $(BOLD)make test$(RESET)             go test ./... -race on all services"
 	@echo "  $(BOLD)make test svc=auth-service$(RESET)  Test one service"
 	@echo ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  DEV-UP  — idempotent one-click local dev environment
+#
+#  Usage:
+#    make dev-up          # first run or resuming after mk-stop
+#    make dev-up FORCE=1  # tear everything down and rebuild from scratch
+#
+#  What it does (skips steps that are already done):
+#    1. Start minikube (skip if already Running)
+#    2. Install CloudNativePG operator (skip if already present)
+#    3. Create Kubernetes secrets from .env.secrets (skip if all exist)
+#    4. Patch manifests to use ghcr.io/sharanch/inkwell images
+#    5. Apply all k8s manifests
+#    6. Apply dev ingress (no TLS)
+#    7. Wait for CNPG clusters to elect a primary (postgres is slow)
+#    8. Wait for all app deployments to roll out
+#    9. Print access URL + status summary
+#
+#  Prerequisites: .env.secrets must exist (copy from .env.example and fill)
+# ─────────────────────────────────────────────────────────────────────────────
+.PHONY: dev-up dev-down _dev-mk-start _dev-cnpg _dev-wait-db
+
+dev-up: _check-secrets
+	@echo ""
+	@echo "$(GREEN)$(BOLD)╔══════════════════════════════════════════════╗$(RESET)"
+	@echo "$(GREEN)$(BOLD)║        Inkwell — dev-up starting             ║$(RESET)"
+	@echo "$(GREEN)$(BOLD)╚══════════════════════════════════════════════╝$(RESET)"
+	@echo ""
+ifdef FORCE
+	@echo "$(YELLOW)$(BOLD)FORCE=1 — tearing down existing environment...$(RESET)"
+	@minikube delete 2>/dev/null || true
+endif
+	@$(MAKE) _dev-mk-start
+	@echo ""
+	@echo "$(CYAN)$(BOLD)[2/8] Installing CloudNativePG operator...$(RESET)"
+	@$(MAKE) _dev-cnpg
+	@echo ""
+	@echo "$(CYAN)$(BOLD)[3/8] Creating secrets...$(RESET)"
+	@$(MAKE) k8s-secrets
+	@echo ""
+	@echo "$(CYAN)$(BOLD)[4/8] Patching manifests for ghcr.io images...$(RESET)"
+	@$(MAKE) k8s-patch-prod
+	@echo ""
+	@echo "$(CYAN)$(BOLD)[5/8] Applying manifests...$(RESET)"
+	@$(MAKE) k8s-apply
+	@echo ""
+	@echo "$(CYAN)$(BOLD)[6/8] Applying dev ingress...$(RESET)"
+	@$(MAKE) k8s-ingress
+	@echo ""
+	@echo "$(CYAN)$(BOLD)[7/8] Waiting for Postgres clusters to be ready...$(RESET)"
+	@$(MAKE) _dev-wait-db
+	@echo ""
+	@echo "$(CYAN)$(BOLD)[8/8] Waiting for app deployments to roll out...$(RESET)"
+	@$(MAKE) wait-ready
+	@echo ""
+	@echo "$(GREEN)$(BOLD)╔══════════════════════════════════════════════╗$(RESET)"
+	@echo "$(GREEN)$(BOLD)║   ✓  Inkwell is up!                          ║$(RESET)"
+	@echo "$(GREEN)$(BOLD)╚══════════════════════════════════════════════╝$(RESET)"
+	@echo ""
+	@echo "  $(BOLD)Frontend:$(RESET) http://inkwell.local"
+	@echo "  $(BOLD)API:     $(RESET) http://inkwell.local/api/"
+	@echo "  $(BOLD)OTP logs:$(RESET) make k8s-logs svc=notify-service"
+	@echo ""
+	@$(MAKE) k8s-status
+
+# Tear down cluster but leave minikube binary intact
+dev-down:
+	@echo "$(YELLOW)$(BOLD)Tearing down Inkwell dev environment...$(RESET)"
+	@$(MAKE) k8s-delete
+	@echo "$(YELLOW)Stopping minikube...$(RESET)"
+	@minikube stop
+	@echo "$(GREEN)✓ Done. Run 'make dev-up' to bring it back up.$(RESET)"
+
+# ── internal helpers ──────────────────────────────────────────────────────────
+
+# Start minikube only if it isn't already Running
+_dev-mk-start:
+	@echo "$(CYAN)$(BOLD)[1/9] Checking minikube...$(RESET)"
+	@STATUS=$$(minikube status --format='{{.Host}}' 2>/dev/null || echo "Nonexistent"); \
+	if [ "$$STATUS" = "Running" ]; then \
+		echo "$(GREEN)  ✓ minikube already running — skipping start$(RESET)"; \
+		echo "$(CYAN)  Ensuring ingress + metrics-server addons are enabled...$(RESET)"; \
+		minikube addons enable ingress 2>/dev/null || true; \
+		minikube addons enable metrics-server 2>/dev/null || true; \
+	else \
+		echo "$(GREEN)  Starting minikube...$(RESET)"; \
+		minikube start \
+			--cpus=4 \
+			--memory=6g \
+			--disk-size=20g \
+			--driver=docker \
+			--addons=ingress,metrics-server; \
+		$(MAKE) mk-hosts; \
+	fi
+
+# Install CNPG operator if not present, or reinstall if the controller is unhealthy
+_dev-cnpg:
+	@REINSTALL=0; \
+	if ! kubectl get crd clusters.postgresql.cnpg.io &>/dev/null; then \
+		echo "$(GREEN)  CloudNativePG not found — installing...$(RESET)"; \
+		REINSTALL=1; \
+	elif ! kubectl get crd poolers.postgresql.cnpg.io &>/dev/null; then \
+		echo "$(YELLOW)  ⚠ CNPG CRDs incomplete (poolers missing) — reinstalling...$(RESET)"; \
+		kubectl delete -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.22/releases/cnpg-1.22.1.yaml 2>/dev/null || true; \
+		sleep 10; \
+		REINSTALL=1; \
+	elif ! kubectl rollout status deployment/cnpg-controller-manager -n cnpg-system --timeout=30s &>/dev/null; then \
+		echo "$(YELLOW)  ⚠ CNPG controller unhealthy — reinstalling...$(RESET)"; \
+		kubectl delete -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.22/releases/cnpg-1.22.1.yaml 2>/dev/null || true; \
+		sleep 10; \
+		REINSTALL=1; \
+	else \
+		echo "$(GREEN)  ✓ CloudNativePG operator healthy — skipping$(RESET)"; \
+	fi; \
+	if [ "$$REINSTALL" = "1" ]; then \
+		kubectl apply -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.22/releases/cnpg-1.22.1.yaml; \
+		echo "$(CYAN)  Waiting for CNPG controller...$(RESET)"; \
+		kubectl rollout status deployment/cnpg-controller-manager -n cnpg-system --timeout=120s; \
+		echo "$(CYAN)  Letting webhook register with API server (15s)...$(RESET)"; \
+		sleep 15; \
+		echo "$(GREEN)  ✓ CNPG operator ready$(RESET)"; \
+	fi
+
+# Wait until all three CNPG clusters report a Ready primary.
+# CNPG clusters can take 2-3 minutes on first boot while Postgres initialises.
+# App pods will crashloop until the DB is reachable — we gate here to avoid
+# unnecessary restarts and confusing log noise.
+_dev-wait-db:
+	@echo "  Waiting for postgres-auth, postgres-blog, postgres-feed to elect primaries..."
+	@for cluster in postgres-auth postgres-blog postgres-feed; do \
+		echo "  $(CYAN)→ $$cluster$(RESET)"; \
+		TRIES=0; \
+		until kubectl get cluster $$cluster -n $(NAMESPACE) \
+				-o jsonpath='{.status.readyInstances}' 2>/dev/null | grep -qE '^[1-9]'; do \
+			TRIES=$$((TRIES+1)); \
+			if [ $$TRIES -ge 40 ]; then \
+				echo "$(RED)  ✗ $$cluster did not become ready in time. Check: kubectl describe cluster $$cluster -n $(NAMESPACE)$(RESET)"; \
+				exit 1; \
+			fi; \
+			printf "    waiting... (%ds)\r" "$$((TRIES*5))"; \
+			sleep 5; \
+		done; \
+		echo "$(GREEN)  ✓ $$cluster ready$(RESET)"; \
+	done
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  ONE-CLICK SETUP
@@ -251,7 +401,7 @@ k8s-setup-prod: mk-start k8s-cnpg k8s-secrets k8s-patch-prod k8s-apply k8s-ingre
 
 k8s-cnpg:
 	@echo "$(CYAN)Installing CloudNativePG operator...$(RESET)"
-	kubectl apply -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.23/releases/cnpg-1.23.0.yaml
+	kubectl apply -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.22/releases/cnpg-1.22.1.yaml
 	@echo "$(CYAN)Waiting for CNPG controller to be ready...$(RESET)"
 	kubectl rollout status deployment/cnpg-controller-manager -n cnpg-system --timeout=120s
 	@echo "$(CYAN)Waiting for CNPG webhook to register with API server...$(RESET)"
@@ -308,14 +458,7 @@ k8s-secrets:
 	fi
 	@echo "$(CYAN)Creating Kubernetes secrets from .env.secrets...$(RESET)"
 	@kubectl create namespace $(NAMESPACE) --dry-run=client -o yaml | kubectl apply -f -
-	@MISSING=0; \
-	for secret in inkwell-jwt-secrets postgres-auth-secret postgres-blog-secret postgres-feed-secret smtp-secret; do \
-		kubectl get secret $$secret -n $(NAMESPACE) &>/dev/null || MISSING=1; \
-	done; \
-	if [ "$$MISSING" = "0" ]; then \
-		echo "$(YELLOW)⚠ All secrets already exist — skipping. Run 'make k8s-delete-secrets' to recreate.$(RESET)"; \
-	else \
-		set -a && . ./.env.secrets && set +a && \
+	@set -a && . ./.env.secrets && set +a && \
 		kubectl create secret generic inkwell-jwt-secrets -n $(NAMESPACE) \
 			--from-literal=JWT_SECRET=$$JWT_SECRET \
 			--from-literal=JWT_REFRESH_SECRET=$$JWT_REFRESH_SECRET \
@@ -336,13 +479,13 @@ k8s-secrets:
 			--from-literal=FEED_DB_PASS=$$POSTGRES_FEED_PASS \
 			--dry-run=client -o yaml | kubectl apply -f - && \
 		kubectl create secret generic smtp-secret -n $(NAMESPACE) \
+			--from-literal=SMTP_ENABLED=$${SMTP_ENABLED:-false} \
 			--from-literal=SMTP_HOST=$$SMTP_HOST \
 			--from-literal=SMTP_USER=$$SMTP_USER \
 			--from-literal=SMTP_PASS=$$SMTP_PASS \
 			--from-literal=FROM_EMAIL=$$FROM_EMAIL \
 			--dry-run=client -o yaml | kubectl apply -f - && \
-		echo "$(GREEN)✓ All secrets created$(RESET)"; \
-	fi
+		echo "$(GREEN)✓ All secrets created$(RESET)"
 
 k8s-delete-secrets:
 	kubectl delete secret inkwell-jwt-secrets postgres-auth-secret postgres-blog-secret postgres-feed-secret smtp-secret -n $(NAMESPACE) --ignore-not-found

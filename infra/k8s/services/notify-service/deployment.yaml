@@ -39,6 +39,11 @@ spec:
             - configMapRef:
                 name: notify-service-config
           env:
+            - name: SMTP_ENABLED
+              valueFrom:
+                secretKeyRef:
+                  name: smtp-secret
+                  key: SMTP_ENABLED
             - name: SMTP_HOST
               valueFrom:
                 secretKeyRef:
