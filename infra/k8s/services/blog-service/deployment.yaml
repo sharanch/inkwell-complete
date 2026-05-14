@@ -1,0 +1,122 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blog-service
+  namespace: inkwell
+  labels:
+    app: blog-service
+    version: v1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: blog-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: blog-service
+        version: v1
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8082"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: inkwell-sa
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z postgres-blog 5432; do echo waiting for postgres-blog; sleep 2; done']
+      containers:
+        - name: blog-service
+          image: ghcr.io/sharanch/inkwell/blog-service:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8082
+              name: http
+          envFrom:
+            - configMapRef:
+                name: blog-service-config
+          env:
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: inkwell-jwt-secrets
+                  key: JWT_SECRET
+            - name: BLOG_DB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-blog-secret
+                  key: BLOG_DB_PASS
+            - name: DB_URL
+              value: "postgres://blog_user:$(BLOG_DB_PASS)@postgres-blog:5432/blog_db?sslmode=disable"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8082
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8082
+            initialDelaySeconds: 20
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: blog-service
+  namespace: inkwell
+  labels:
+    app: blog-service
+spec:
+  selector:
+    app: blog-service
+  ports:
+    - port: 8082
+      targetPort: 8082
+      name: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: blog-service-hpa
+  namespace: inkwell
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: blog-service
+  minReplicas: 2
+  maxReplicas: 8
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: blog-service-pdb
+  namespace: inkwell
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: blog-service

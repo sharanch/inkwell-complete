@@ -1,0 +1,56 @@
+# ─── ArgoCD AppProject ────────────────────────────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: inkwell
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: Inkwell blogging platform
+  sourceRepos:
+    - https://github.com/sharanch/inkwell.git
+  destinations:
+    - namespace: inkwell
+      server: https://kubernetes.default.svc
+    - namespace: inkwell-monitoring
+      server: https://kubernetes.default.svc
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: cert-manager.io
+      kind: ClusterIssuer
+  namespaceResourceWhitelist:
+    - group: "apps"
+      kind: Deployment
+    - group: "apps"
+      kind: StatefulSet
+    - group: ""
+      kind: Service
+    - group: ""
+      kind: ConfigMap
+    - group: ""
+      kind: ServiceAccount
+    - group: "networking.k8s.io"
+      kind: Ingress
+    - group: "autoscaling"
+      kind: HorizontalPodAutoscaler
+    - group: "policy"
+      kind: PodDisruptionBudget
+    - group: "networking.istio.io"
+      kind: VirtualService
+    - group: "networking.istio.io"
+      kind: DestinationRule
+    - group: "networking.istio.io"
+      kind: Gateway
+    - group: "security.istio.io"
+      kind: PeerAuthentication
+    - group: "security.istio.io"
+      kind: AuthorizationPolicy
+  roles:
+    - name: developer
+      description: Read-only access for developers
+      policies:
+        - p, proj:inkwell:developer, applications, get, inkwell/*, allow
+      groups:
+        - inkwell-developers

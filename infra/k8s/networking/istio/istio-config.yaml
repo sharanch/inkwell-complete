@@ -1,0 +1,210 @@
+# ─── Istio Gateway ────────────────────────────────────────────────────────────
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: inkwell-gateway
+  namespace: inkwell
+spec:
+  selector:
+    istio: ingressgateway
+  servers:
+    - port:
+        number: 443
+        name: https
+        protocol: HTTPS
+      tls:
+        mode: SIMPLE
+        credentialName: inkwell-tls-cert    # from cert-manager
+      hosts:
+        - "inkwell.app"
+        - "www.inkwell.app"
+    - port:
+        number: 80
+        name: http
+        protocol: HTTP
+      hosts:
+        - "inkwell.app"
+        - "www.inkwell.app"
+      tls:
+        httpsRedirect: true   # Auto-redirect HTTP → HTTPS
+---
+# ─── VirtualService: Frontend + API routing ───────────────────────────────────
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: inkwell-vs
+  namespace: inkwell
+spec:
+  hosts:
+    - "inkwell.app"
+    - "www.inkwell.app"
+  gateways:
+    - inkwell-gateway
+  http:
+    # API routes → api-gateway
+    - match:
+        - uri:
+            prefix: /api/
+      route:
+        - destination:
+            host: api-gateway
+            port:
+              number: 8080
+      timeout: 30s
+      retries:
+        attempts: 3
+        perTryTimeout: 10s
+        retryOn: gateway-error,connect-failure,retriable-4xx
+    # All other routes → frontend
+    - match:
+        - uri:
+            prefix: /
+      route:
+        - destination:
+            host: frontend
+            port:
+              number: 80
+      timeout: 15s
+---
+# ─── DestinationRules: circuit breaker + mTLS per service ─────────────────────
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: api-gateway-dr
+  namespace: inkwell
+spec:
+  host: api-gateway
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        h2UpgradePolicy: UPGRADE
+        http1MaxPendingRequests: 100
+        http2MaxRequests: 1000
+    outlierDetection:
+      consecutiveGatewayErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+      maxEjectionPercent: 50
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: auth-service-dr
+  namespace: inkwell
+spec:
+  host: auth-service
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 50
+      http:
+        http1MaxPendingRequests: 50
+    outlierDetection:
+      consecutiveGatewayErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: blog-service-dr
+  namespace: inkwell
+spec:
+  host: blog-service
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 100
+      http:
+        http1MaxPendingRequests: 100
+    outlierDetection:
+      consecutiveGatewayErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: feed-service-dr
+  namespace: inkwell
+spec:
+  host: feed-service
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+    connectionPool:
+      tcp:
+        maxConnections: 50
+      http:
+        http1MaxPendingRequests: 50
+    outlierDetection:
+      consecutiveGatewayErrors: 5
+      interval: 10s
+      baseEjectionTime: 30s
+---
+apiVersion: networking.istio.io/v1beta1
+kind: DestinationRule
+metadata:
+  name: notify-service-dr
+  namespace: inkwell
+spec:
+  host: notify-service
+  trafficPolicy:
+    tls:
+      mode: ISTIO_MUTUAL
+---
+# ─── PeerAuthentication: enforce mTLS cluster-wide ────────────────────────────
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: inkwell
+spec:
+  mtls:
+    mode: STRICT
+---
+# ─── AuthorizationPolicies: zero-trust service-to-service ─────────────────────
+
+# notify-service is internal only — only auth-service may call it
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: notify-service-authz
+  namespace: inkwell
+spec:
+  selector:
+    matchLabels:
+      app: notify-service
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/inkwell/sa/inkwell-sa"
+      to:
+        - operation:
+            methods: ["POST"]
+            paths: ["/api/*"]
+
+# Backend services: only api-gateway may call them externally
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: backend-services-authz
+  namespace: inkwell
+spec:
+  selector:
+    matchLabels:
+      app: auth-service  # Applied per service — replicate for blog/feed
+  rules:
+    - from:
+        - source:
+            principals:
+              - "cluster.local/ns/inkwell/sa/inkwell-sa"

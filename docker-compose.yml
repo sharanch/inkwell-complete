@@ -1,0 +1,148 @@
+
+services:
+  # ─── Infrastructure ────────────────────────────────────────────────────────
+  postgres-auth:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: auth_db
+      POSTGRES_USER: auth_user
+      POSTGRES_PASSWORD: auth_pass
+    volumes:
+      - auth_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U auth_user -d auth_db"]
+      interval: 5s
+      retries: 5
+
+  postgres-blog:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: blog_db
+      POSTGRES_USER: blog_user
+      POSTGRES_PASSWORD: blog_pass
+    volumes:
+      - blog_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blog_user -d blog_db"]
+      interval: 5s
+      retries: 5
+
+  postgres-feed:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: feed_db
+      POSTGRES_USER: feed_user
+      POSTGRES_PASSWORD: feed_pass
+    volumes:
+      - feed_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U feed_user -d feed_db"]
+      interval: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 5
+
+  # ─── Backend Services ──────────────────────────────────────────────────────
+  auth-service:
+    build:
+      context: ./auth-service
+      dockerfile: Dockerfile
+    environment:
+      PORT: 8081
+      DB_URL: postgres://auth_user:auth_pass@postgres-auth:5432/auth_db?sslmode=disable
+      REDIS_URL: redis:6379
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-change-me-refresh}
+      OTP_TTL_MINUTES: 10
+      NOTIFY_SERVICE_URL: http://notify-service:8084
+    depends_on:
+      postgres-auth:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  blog-service:
+    build:
+      context: ./blog-service
+      dockerfile: Dockerfile
+    environment:
+      PORT: 8082
+      DB_URL: postgres://blog_user:blog_pass@postgres-blog:5432/blog_db?sslmode=disable
+      FEED_SERVICE_URL: http://feed-service:8083
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+    depends_on:
+      postgres-blog:
+        condition: service_healthy
+
+  feed-service:
+    build:
+      context: ./feed-service
+      dockerfile: Dockerfile
+    environment:
+      PORT: 8083
+      DB_URL: postgres://feed_user:feed_pass@postgres-feed:5432/feed_db?sslmode=disable
+      REDIS_URL: redis:6379
+      BLOG_SERVICE_URL: http://blog-service:8082
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+    depends_on:
+      postgres-feed:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  notify-service:
+    build:
+      context: ./notify-service
+      dockerfile: Dockerfile
+    environment:
+      PORT: 8084
+      REDIS_URL: redis:6379
+      SMTP_ENABLED: ${SMTP_ENABLED:-false}
+      SMTP_HOST: ${SMTP_HOST:-smtp.example.com}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-noreply@example.com}
+      SMTP_PASS: ${SMTP_PASS:-smtp-password}
+      FROM_EMAIL: ${FROM_EMAIL:-noreply@inkwell.app}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  api-gateway:
+    build:
+      context: ./api-gateway
+      dockerfile: Dockerfile
+    environment:
+      PORT: 8080
+      AUTH_SERVICE_URL: http://auth-service:8081
+      BLOG_SERVICE_URL: http://blog-service:8082
+      FEED_SERVICE_URL: http://feed-service:8083
+      NOTIFY_SERVICE_URL: http://notify-service:8084
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+    ports:
+      - "8080:8080"
+    depends_on:
+      - auth-service
+      - blog-service
+      - feed-service
+      - notify-service
+
+  # ─── Frontend ─────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      - api-gateway
+
+volumes:
+  auth_pgdata:
+  blog_pgdata:
+  feed_pgdata:

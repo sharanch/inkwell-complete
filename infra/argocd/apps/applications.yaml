@@ -1,0 +1,119 @@
+# ─── App of Apps pattern ──────────────────────────────────────────────────────
+# Deploy this once to bootstrap; ArgoCD will manage everything else.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: inkwell-app-of-apps
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: inkwell
+  source:
+    repoURL: https://github.com/sharanch/inkwell.git
+    targetRevision: main
+    path: infra/argocd/apps
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+---
+# ─── Individual Apps ──────────────────────────────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: inkwell-base
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: inkwell
+spec:
+  project: inkwell
+  source:
+    repoURL: https://github.com/sharanch/inkwell.git
+    targetRevision: main
+    path: infra/k8s/base
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: inkwell
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: inkwell-databases
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: inkwell
+spec:
+  project: inkwell
+  source:
+    repoURL: https://github.com/sharanch/inkwell.git
+    targetRevision: main
+    path: infra/k8s/databases
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: inkwell
+  syncPolicy:
+    automated:
+      prune: false        # Databases: never auto-prune (data safety)
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: inkwell-services
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: inkwell
+spec:
+  project: inkwell
+  source:
+    repoURL: https://github.com/sharanch/inkwell.git
+    targetRevision: main
+    path: infra/k8s/services
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: inkwell
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true
+  revisionHistoryLimit: 5
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: inkwell-networking
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: inkwell
+spec:
+  project: inkwell
+  source:
+    repoURL: https://github.com/sharanch/inkwell.git
+    targetRevision: main
+    path: infra/k8s/networking
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: inkwell
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - ServerSideApply=true

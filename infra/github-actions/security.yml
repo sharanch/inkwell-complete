@@ -1,0 +1,80 @@
+name: Security
+
+on:
+  schedule:
+    - cron: "0 2 * * *"   # Daily at 2 AM
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ─── Trivy image vulnerability scanning ─────────────────────────────────────
+  trivy-scan:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [api-gateway, auth-service, blog-service, feed-service, notify-service, frontend]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image for scanning
+        run: docker build -t inkwell/${{ matrix.service }}:scan ./${{ matrix.service }}
+
+      - name: Run Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: inkwell/${{ matrix.service }}:scan
+          format: "sarif"
+          output: "trivy-${{ matrix.service }}.sarif"
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"
+
+      - name: Upload scan results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: "trivy-${{ matrix.service }}.sarif"
+
+  # ─── Secrets scanning ────────────────────────────────────────────────────────
+  gitleaks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ─── Go dependency audit ─────────────────────────────────────────────────────
+  govulncheck:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [api-gateway, auth-service, blog-service, feed-service, notify-service]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Run govulncheck
+        working-directory: ${{ matrix.service }}
+        run: govulncheck ./...
+
+  # ─── Infrastructure-as-code security ──────────────────────────────────────────
+  kube-score:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kube-score
+        run: |
+          curl -L https://github.com/zegl/kube-score/releases/download/v1.18.0/kube-score_1.18.0_linux_amd64.tar.gz | tar xz
+          sudo mv kube-score /usr/local/bin/
+      - name: Score k8s manifests
+        run: |
+          find infra/k8s -name "*.yaml" -exec kube-score score {} \; || true

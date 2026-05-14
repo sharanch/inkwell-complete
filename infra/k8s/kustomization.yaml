@@ -1,0 +1,18 @@
+# infra/k8s/kustomization.yaml — root kustomization
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - base/namespaces/namespaces.yaml
+  - base/configmaps/configmaps.yaml
+  - base/rbac.yaml
+  - databases/postgres-auth/statefulset.yaml
+  - databases/redis/statefulset.yaml
+  - services/api-gateway/deployment.yaml
+  - services/auth-service/deployment.yaml
+  - services/blog-service/deployment.yaml
+  - services/feed-service/deployment.yaml
+  - services/notify-service/deployment.yaml
+  - services/frontend/deployment.yaml
+  - networking/istio/istio-config.yaml
+  - networking/ingress/ingress.yaml

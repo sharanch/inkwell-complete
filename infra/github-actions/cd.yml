@@ -1,0 +1,172 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "infra/k8s/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deployment target"
+        required: true
+        type: choice
+        options: [staging, production]
+      service:
+        description: "Service to redeploy (or 'all')"
+        required: false
+        default: "all"
+
+jobs:
+  # ─── Deploy to staging (auto on every main merge) ───────────────────────────
+  deploy-staging:
+    runs-on: ubuntu-latest
+    environment: staging
+    concurrency:
+      group: deploy-staging
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "v1.29.0"
+
+      - name: Configure kubeconfig (staging)
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_STAGING }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Verify cluster connection
+        run: kubectl cluster-info
+
+      - name: Apply k8s manifests
+        run: |
+          kubectl apply -f infra/k8s/base/ --recursive
+          kubectl apply -f infra/k8s/databases/ --recursive
+          kubectl apply -f infra/k8s/services/ --recursive
+          kubectl apply -f infra/k8s/networking/ --recursive
+
+      - name: Wait for rollout
+        run: |
+          for deploy in api-gateway auth-service blog-service feed-service notify-service frontend; do
+            echo "Waiting for $deploy..."
+            kubectl rollout status deployment/$deploy -n inkwell --timeout=300s
+          done
+
+      - name: Run smoke tests
+        run: |
+          GATEWAY_URL=$(kubectl get svc -n inkwell api-gateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
+          echo "Testing health endpoint..."
+          curl -f "http://${GATEWAY_URL}/healthz" || exit 1
+          echo "Smoke tests passed!"
+
+      - name: Notify Slack on failure
+        if: failure()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "❌ Staging deploy failed on commit ${{ github.sha }}",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "❌ *Staging deploy failed*\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View run>"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ─── Deploy to production (manual approval required) ─────────────────────────
+  deploy-production:
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment: production    # GitHub env protection rules enforce manual approval
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: "v1.29.0"
+
+      - name: Configure kubeconfig (production)
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PRODUCTION }}" | base64 -d > ~/.kube/config
+          chmod 600 ~/.kube/config
+
+      - name: Apply k8s manifests
+        run: |
+          kubectl apply -f infra/k8s/base/ --recursive
+          kubectl apply -f infra/k8s/databases/ --recursive
+          kubectl apply -f infra/k8s/services/ --recursive
+          kubectl apply -f infra/k8s/networking/ --recursive
+
+      - name: Wait for rollout
+        run: |
+          for deploy in api-gateway auth-service blog-service feed-service notify-service frontend; do
+            echo "Waiting for $deploy..."
+            kubectl rollout status deployment/$deploy -n inkwell --timeout=300s
+          done
+
+      - name: Run production smoke tests
+        run: |
+          echo "Testing production endpoints..."
+          curl -f "https://inkwell.app/api/v1/health" || exit 1
+          echo "Production smoke tests passed!"
+
+      - name: Create GitHub deployment status
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.createDeploymentStatus({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              deployment_id: context.payload.deployment?.id,
+              state: 'success',
+              environment_url: 'https://inkwell.app',
+              description: 'Production deployment successful'
+            });
+
+      - name: Notify Slack on success
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "✅ Production deploy succeeded for ${{ github.sha }}"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ─── Rollback job (manual trigger) ────────────────────────────────────────────
+  rollback:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'
+    environment: production
+    steps:
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBECONFIG_PRODUCTION }}" | base64 -d > ~/.kube/config
+
+      - name: Rollback deployments
+        run: |
+          SERVICES="${{ github.event.inputs.service }}"
+          if [ "$SERVICES" = "all" ]; then
+            SERVICES="api-gateway auth-service blog-service feed-service notify-service frontend"
+          fi
+          for svc in $SERVICES; do
+            echo "Rolling back $svc..."
+            kubectl rollout undo deployment/$svc -n inkwell
+          done

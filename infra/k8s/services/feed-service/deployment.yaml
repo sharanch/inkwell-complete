@@ -1,0 +1,121 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feed-service
+  namespace: inkwell
+  labels:
+    app: feed-service
+    version: v1
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: feed-service
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: feed-service
+        version: v1
+    spec:
+      serviceAccountName: inkwell-sa
+      terminationGracePeriodSeconds: 30
+      initContainers:
+        - name: wait-for-postgres
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z postgres-feed 5432; do echo waiting; sleep 2; done']
+        - name: wait-for-redis
+          image: busybox:1.36
+          command: ['sh', '-c', 'until nc -z redis 6379; do echo waiting; sleep 2; done']
+      containers:
+        - name: feed-service
+          image: ghcr.io/sharanch/inkwell/feed-service:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 8083
+              name: http
+          envFrom:
+            - configMapRef:
+                name: feed-service-config
+          env:
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: inkwell-jwt-secrets
+                  key: JWT_SECRET
+            - name: FEED_DB_PASS
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-feed-secret
+                  key: FEED_DB_PASS
+            - name: DB_URL
+              value: "postgres://feed_user:$(FEED_DB_PASS)@postgres-feed:5432/feed_db?sslmode=disable"
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 400m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8083
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8083
+            initialDelaySeconds: 20
+            periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: feed-service
+  namespace: inkwell
+  labels:
+    app: feed-service
+spec:
+  selector:
+    app: feed-service
+  ports:
+    - port: 8083
+      targetPort: 8083
+      name: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: feed-service-hpa
+  namespace: inkwell
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: feed-service
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 60
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: feed-service-pdb
+  namespace: inkwell
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: feed-service

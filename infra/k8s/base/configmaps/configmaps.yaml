@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: api-gateway-config
+  namespace: inkwell
+data:
+  PORT: "8080"
+  AUTH_SERVICE_URL: "http://auth-service:8081"
+  BLOG_SERVICE_URL: "http://blog-service:8082"
+  FEED_SERVICE_URL: "http://feed-service:8083"
+  NOTIFY_SERVICE_URL: "http://notify-service:8084"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: auth-service-config
+  namespace: inkwell
+data:
+  PORT: "8081"
+  REDIS_URL: "redis:6379"
+  OTP_TTL_MINUTES: "10"
+  NOTIFY_SERVICE_URL: "http://notify-service:8084"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: blog-service-config
+  namespace: inkwell
+data:
+  PORT: "8082"
+  FEED_SERVICE_URL: "http://feed-service:8083"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: feed-service-config
+  namespace: inkwell
+data:
+  PORT: "8083"
+  REDIS_URL: "redis:6379"
+  BLOG_SERVICE_URL: "http://blog-service:8082"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: notify-service-config
+  namespace: inkwell
+data:
+  PORT: "8084"
+  REDIS_URL: "redis:6379"
+  SMTP_ENABLED: "true"
+  SMTP_PORT: "587"
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: inkwell
+data:
+  redis.conf: |
+    maxmemory 256mb
+    maxmemory-policy allkeys-lru
+    appendonly no
+    save ""
+    tcp-keepalive 300
+    timeout 0
